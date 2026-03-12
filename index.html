@@ -287,10 +287,14 @@ async function connect() {
   setStatus('connecting', 'Requesting microphone…');
 
   try {
-    /* 1. Get mic — in MODE_IN_COMMUNICATION this will be BT SCO (ESP32 mic output) */
+    /* 1. Get mic with echoCancellation ON — this is the key flag that makes
+     *    Chrome call AudioManager.startBluetoothSco() on Android, routing
+     *    both mic and speaker through BT HFP SCO instead of phone speakers.
+     *    AEC won't cancel our FSK signal because it arrives on a different
+     *    time/data path than the locally-played FSK output. */
     const micStream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        echoCancellation: false,
+        echoCancellation: true,
         noiseSuppression: false,
         autoGainControl: false,
       }
