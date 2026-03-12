@@ -18,8 +18,7 @@
   }
   #status-dot {
     width: 10px; height: 10px; border-radius: 50%;
-    background: #555; flex-shrink: 0;
-    transition: background 0.3s;
+    background: #555; flex-shrink: 0; transition: background 0.3s;
   }
   #status-dot.connecting { background: #f39c12; }
   #status-dot.connected  { background: #2ecc71; }
@@ -30,7 +29,7 @@
     color: #e94560; padding: 6px 14px; border-radius: 6px;
     font-size: 13px; cursor: pointer;
   }
-  #connect-btn:active { background: #e94560; color: #fff; }
+  #connect-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   #messages {
     flex: 1; overflow-y: auto; padding: 12px;
     display: flex; flex-direction: column; gap: 8px;
@@ -39,18 +38,9 @@
     max-width: 80%; padding: 8px 12px; border-radius: 12px;
     font-size: 15px; line-height: 1.4; word-break: break-word;
   }
-  .msg.esp32 {
-    background: #0f3460; align-self: flex-start;
-    border-bottom-left-radius: 3px;
-  }
-  .msg.me {
-    background: #e94560; align-self: flex-end;
-    border-bottom-right-radius: 3px;
-  }
-  .msg.sys {
-    background: #222; align-self: center;
-    color: #888; font-size: 12px; max-width: 90%;
-  }
+  .msg.esp32 { background: #0f3460; align-self: flex-start; border-bottom-left-radius: 3px; }
+  .msg.me    { background: #e94560; align-self: flex-end;   border-bottom-right-radius: 3px; }
+  .msg.sys   { background: #222; align-self: center; color: #888; font-size: 12px; max-width: 90%; }
   #input-row {
     display: flex; gap: 8px; padding: 10px 12px;
     background: #16213e; border-top: 1px solid #0f3460;
@@ -66,10 +56,7 @@
     padding: 10px 18px; border-radius: 8px; font-size: 15px; cursor: pointer;
   }
   #send-btn:disabled { background: #555; cursor: not-allowed; }
-  #dbg {
-    font-size: 10px; color: #444; padding: 2px 12px;
-    background: #111; min-height: 18px; font-family: monospace;
-  }
+  #dbg { font-size: 10px; color: #444; padding: 2px 12px; background: #111; min-height: 18px; font-family: monospace; }
 </style>
 </head>
 <body>
@@ -81,8 +68,11 @@
 </div>
 
 <div id="messages">
-  <div class="msg sys">Connect the ESP32 via iPhone Bluetooth first,<br>
-  then tap Connect here to open the audio channel.</div>
+  <div class="msg sys">
+    1. Pair your phone to <b>ESP32-Modem</b> in Bluetooth settings<br>
+    2. Tap Connect and allow microphone<br>
+    3. Audio will route through Bluetooth
+  </div>
 </div>
 
 <div id="dbg"></div>
@@ -95,18 +85,17 @@
 
 <script>
 /* ════════════════════════════════════════════════════════════════════════
- * FSK Modem — AudioWorklet code (runs in audio thread)
- * Protocol matches firmware exactly:
- *   300 baud, 1200 Hz mark (1), 2200 Hz space (0)
- *   Frame: [0xAA x3] [0x7E] [LEN] [DATA] [CRC8] [0x7E]
+ * FSK AudioWorklet — runs in audio thread
+ * 300 baud, 1200 Hz mark, 2200 Hz space
+ * Frame: [0xAA×3][0x7E][LEN][DATA][CRC8][0x7E]
  * ════════════════════════════════════════════════════════════════════════ */
 const WORKLET_CODE = `
-const BAUD_RATE    = 300;
-const MARK_FREQ    = 1200;
-const SPACE_FREQ   = 2200;
-const PREAMBLE     = 0xAA;
-const FRAME_FLAG   = 0x7E;
-const AMPLITUDE    = 0.6;
+const BAUD_RATE  = 300;
+const MARK_FREQ  = 1200;
+const SPACE_FREQ = 2200;
+const PREAMBLE   = 0xAA;
+const FRAME_FLAG = 0x7E;
+const AMPLITUDE  = 0.55;
 
 function crc8(data) {
   let crc = 0xFF;
@@ -118,90 +107,75 @@ function crc8(data) {
   return crc;
 }
 
-/* ── RX: dual Goertzel filter ─────────────────────────────────────────── */
 class Goertzel {
-  constructor(freq, sampleRate, blockSize) {
-    this.coeff = 2 * Math.cos(2 * Math.PI * freq / sampleRate);
-    this.N = blockSize;
-    this.q1 = this.q2 = this.count = 0;
+  constructor(freq, sr, N) {
+    this.coeff = 2 * Math.cos(2 * Math.PI * freq / sr);
+    this.N = N; this.q1 = this.q2 = this.count = 0;
   }
   add(s) {
     const q0 = this.coeff * this.q1 - this.q2 + s;
     this.q2 = this.q1; this.q1 = q0;
     if (++this.count < this.N) return -1;
-    const mag = this.q1*this.q1 + this.q2*this.q2 - this.q1*this.q2*this.coeff;
+    const m = this.q1*this.q1 + this.q2*this.q2 - this.q1*this.q2*this.coeff;
     this.q1 = this.q2 = this.count = 0;
-    return mag;
+    return m;
   }
 }
 
-/* ── UART-style bit receiver ──────────────────────────────────────────── */
 class UartRx {
-  constructor() { this.state = 0; this.byte = 0; this.ready = false; this.err = false; }
-  reset()       { this.state = 0; this.byte = 0; this.ready = false; this.err = false; }
+  constructor() { this.state = 0; this.byte = 0; this.ready = this.err = false; }
+  reset()       { this.state = 0; this.byte = 0; this.ready = this.err = false; }
   feed(bit) {
-    this.ready = false; this.err = false;
-    if (this.state === 0) {
-      if (bit === 0) { this.state = 1; this.byte = 0; }
-    } else if (this.state <= 8) {
-      this.byte |= (bit << (this.state - 1));
-      this.state++;
-    } else {
-      this.state = 0;
-      if (bit === 1) this.ready = true; else this.err = true;
-    }
+    this.ready = this.err = false;
+    if (this.state === 0) { if (bit === 0) { this.state = 1; this.byte = 0; } }
+    else if (this.state <= 8) { this.byte |= (bit << (this.state - 1)); this.state++; }
+    else { this.state = 0; if (bit === 1) this.ready = true; else this.err = true; }
   }
 }
 
 class FSKProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    const sr = sampleRate;
-    const blockSize = Math.round(sr / BAUD_RATE);
-    this.gMark  = new Goertzel(MARK_FREQ,  sr, blockSize);
-    this.gSpace = new Goertzel(SPACE_FREQ, sr, blockSize);
+    const sr  = sampleRate;
+    const N   = Math.round(sr / BAUD_RATE);
+    this.gMark  = new Goertzel(MARK_FREQ,  sr, N);
+    this.gSpace = new Goertzel(SPACE_FREQ, sr, N);
     this.uart   = new UartRx();
 
-    /* RX state machine */
-    this.rxTop    = 'HUNT';   /* HUNT | PREAMBLE | FRAME */
-    this.rxFrame  = 'START';  /* START | LEN | DATA | CRC | END */
-    this.consecMark     = 0;
-    this.preambleCount  = 0;
-    this.msgBuf   = [];
-    this.msgLen   = 0;
-    this.msgCrc   = 0;
+    /* RX state */
+    this.rxTop   = 'HUNT';
+    this.rxFrame = 'START';
+    this.consecMark = 0; this.preambleCnt = 0;
+    this.msgBuf = []; this.msgLen = 0; this.msgCrc = 0;
 
     /* TX state */
-    this.txBits   = [];        /* bit queue */
-    this.txPhase  = 0;
-    this.txSamplesLeft = 0;
-    this.txCurrentBit  = 1;   /* idle = mark */
+    this.txBits  = [];
+    this.txPhase = 0;
+    this.txLeft  = 0;
+    this.txBit   = 1;  /* idle = mark */
     this.txPhaseIncMark  = 2 * Math.PI * MARK_FREQ  / sr;
     this.txPhaseIncSpace = 2 * Math.PI * SPACE_FREQ / sr;
     this.samplesPerBit   = sr / BAUD_RATE;
 
-    this.port.onmessage = (e) => {
-      if (e.data.type === 'send') this._encodeSend(e.data.text);
-    };
+    this.port.onmessage = e => { if (e.data.type === 'send') this._encode(e.data.text); };
   }
 
   _pushBit(b) { this.txBits.push(b); }
   _pushByte(byte) {
-    this._pushBit(0); /* start */
+    this._pushBit(0);
     for (let i = 0; i < 8; i++) this._pushBit((byte >> i) & 1);
-    this._pushBit(1); /* stop */
+    this._pushBit(1);
   }
-  _encodeSend(text) {
-    const enc = new TextEncoder();
-    const data = enc.encode(text.slice(0, 240));
-    for (let i = 0; i < 20; i++) this._pushBit(1); /* idle prefix */
+  _encode(text) {
+    const data = new TextEncoder().encode(text.slice(0, 240));
+    for (let i = 0; i < 20; i++) this._pushBit(1);
     for (let i = 0; i < 3; i++) this._pushByte(PREAMBLE);
     this._pushByte(FRAME_FLAG);
     this._pushByte(data.length);
     for (const b of data) this._pushByte(b);
     this._pushByte(crc8(data));
     this._pushByte(FRAME_FLAG);
-    for (let i = 0; i < 20; i++) this._pushBit(1); /* idle suffix */
+    for (let i = 0; i < 20; i++) this._pushBit(1);
   }
 
   _rxBit(bit) {
@@ -209,22 +183,19 @@ class FSKProcessor extends AudioWorkletProcessor {
     case 'HUNT':
       this.consecMark = bit ? this.consecMark + 1 : 0;
       if (this.consecMark >= 15) {
-        this.rxTop = 'PREAMBLE'; this.preambleCount = 0;
-        this.consecMark = 0; this.uart.reset();
+        this.rxTop = 'PREAMBLE'; this.preambleCnt = 0; this.consecMark = 0; this.uart.reset();
       }
       break;
     case 'PREAMBLE':
       this.uart.feed(bit);
-      if (this.uart.err) { this.rxTop = 'HUNT'; this.preambleCount = 0; this.uart.reset(); break; }
+      if (this.uart.err) { this.rxTop = 'HUNT'; this.preambleCnt = 0; this.uart.reset(); break; }
       if (!this.uart.ready) break;
       if (this.uart.byte === PREAMBLE) {
-        if (++this.preambleCount >= 3) {
-          this.rxTop = 'FRAME'; this.rxFrame = 'START'; this.msgBuf = []; this.uart.reset();
-        }
-      } else if (this.uart.byte === FRAME_FLAG && this.preambleCount >= 1) {
+        if (++this.preambleCnt >= 3) { this.rxTop = 'FRAME'; this.rxFrame = 'START'; this.msgBuf = []; this.uart.reset(); }
+      } else if (this.uart.byte === FRAME_FLAG && this.preambleCnt >= 1) {
         this.rxTop = 'FRAME'; this.rxFrame = 'LEN'; this.msgBuf = []; this.uart.reset();
-      } else {
-        this.rxTop = 'HUNT'; this.preambleCount = 0; this.uart.reset();
+      } else if (this.uart.byte !== PREAMBLE) {
+        this.rxTop = 'HUNT'; this.preambleCnt = 0; this.uart.reset();
       }
       break;
     case 'FRAME':
@@ -233,31 +204,15 @@ class FSKProcessor extends AudioWorkletProcessor {
       if (!this.uart.ready) break;
       const b = this.uart.byte; this.uart.reset();
       switch (this.rxFrame) {
-      case 'START':
-        if (b === FRAME_FLAG) { this.rxFrame = 'LEN'; this.msgBuf = []; }
-        else this.rxTop = 'HUNT';
-        break;
-      case 'LEN':
-        this.msgLen = b;
-        this.rxFrame = b > 0 ? 'DATA' : 'CRC';
-        break;
-      case 'DATA':
-        this.msgBuf.push(b);
-        if (this.msgBuf.length >= this.msgLen) this.rxFrame = 'CRC';
-        break;
-      case 'CRC':
-        this.msgCrc = b; this.rxFrame = 'END';
-        break;
+      case 'START': if (b === FRAME_FLAG) { this.rxFrame = 'LEN'; this.msgBuf = []; } else this.rxTop = 'HUNT'; break;
+      case 'LEN':   this.msgLen = b; this.rxFrame = b > 0 ? 'DATA' : 'CRC'; break;
+      case 'DATA':  this.msgBuf.push(b); if (this.msgBuf.length >= this.msgLen) this.rxFrame = 'CRC'; break;
+      case 'CRC':   this.msgCrc = b; this.rxFrame = 'END'; break;
       case 'END':
-        if (b === FRAME_FLAG) {
-          const calc = crc8(this.msgBuf);
-          if (calc === this.msgCrc) {
-            const text = new TextDecoder().decode(new Uint8Array(this.msgBuf));
-            this.port.postMessage({ type: 'recv', text });
-          } else {
-            this.port.postMessage({ type: 'crcerr' });
-          }
-        }
+        if (b === FRAME_FLAG && crc8(this.msgBuf) === this.msgCrc)
+          this.port.postMessage({ type: 'recv', text: new TextDecoder().decode(new Uint8Array(this.msgBuf)) });
+        else if (b === FRAME_FLAG)
+          this.port.postMessage({ type: 'crcerr' });
         this.rxTop = 'HUNT';
         break;
       }
@@ -266,39 +221,36 @@ class FSKProcessor extends AudioWorkletProcessor {
   }
 
   process(inputs, outputs) {
-    /* RX: analyze input channel 0 */
-    const inputChannel = inputs[0] && inputs[0][0];
-    if (inputChannel) {
-      for (let i = 0; i < inputChannel.length; i++) {
-        const em = this.gMark.add(inputChannel[i]);
-        const es = this.gSpace.add(inputChannel[i]);
-        if (em >= 0 && es >= 0) { /* both blocks complete simultaneously */
+    const inp = inputs[0]?.[0];
+    const out = outputs[0]?.[0];
+
+    /* RX: decode incoming audio from ESP32 */
+    if (inp) {
+      for (let i = 0; i < inp.length; i++) {
+        const em = this.gMark.add(inp[i]);
+        const es = this.gSpace.add(inp[i]);
+        if (em >= 0 && es >= 0) {
           const total = em + es;
-          if (total < 0.0002) { /* silence */
-            this.rxTop = 'HUNT'; this.consecMark = 0;
-            this.preambleCount = 0; this.uart.reset();
-          } else {
-            this._rxBit(em >= es ? 1 : 0);
-          }
+          if (total < 0.0002) { this.rxTop = 'HUNT'; this.consecMark = 0; this.preambleCnt = 0; this.uart.reset(); }
+          else this._rxBit(em >= es ? 1 : 0);
         }
       }
     }
 
-    /* TX: generate output on channel 0 */
-    const outputChannel = outputs[0] && outputs[0][0];
-    if (outputChannel) {
-      for (let i = 0; i < outputChannel.length; i++) {
-        if (this.txSamplesLeft <= 0) {
-          this.txCurrentBit = this.txBits.length > 0 ? this.txBits.shift() : 1;
-          this.txSamplesLeft += this.samplesPerBit;
+    /* TX: generate outgoing FSK to send to ESP32 */
+    if (out) {
+      for (let i = 0; i < out.length; i++) {
+        if (this.txLeft <= 0) {
+          this.txBit  = this.txBits.length > 0 ? this.txBits.shift() : 1;
+          this.txLeft += this.samplesPerBit;
         }
-        const inc = this.txCurrentBit ? this.txPhaseIncMark : this.txPhaseIncSpace;
-        outputChannel[i] = AMPLITUDE * Math.sin(this.txPhase);
+        const inc = this.txBit ? this.txPhaseIncMark : this.txPhaseIncSpace;
+        out[i]       = AMPLITUDE * Math.sin(this.txPhase);
         this.txPhase = (this.txPhase + inc) % (2 * Math.PI);
-        this.txSamplesLeft -= 1;
+        this.txLeft -= 1;
       }
     }
-    return true; /* keep processor alive */
+    return true;
   }
 }
 registerProcessor('fsk-processor', FSKProcessor);
@@ -306,41 +258,37 @@ registerProcessor('fsk-processor', FSKProcessor);
 
 /* ════════════════════════════════════════════════════════════════════════
  * Main App
+ * Key trick for Android: wrap audio in RTCPeerConnection.
+ * Chrome switches to AudioManager.MODE_IN_COMMUNICATION when WebRTC is
+ * active, which routes BOTH mic and speaker through BT HFP SCO instead
+ * of the phone's speakers. This is how Meet/WhatsApp Web use BT headsets.
  * ════════════════════════════════════════════════════════════════════════ */
-const connectBtn  = document.getElementById('connect-btn');
-const statusDot   = document.getElementById('status-dot');
-const statusText  = document.getElementById('status-text');
-const messages    = document.getElementById('messages');
-const msgInput    = document.getElementById('msg-input');
-const sendBtn     = document.getElementById('send-btn');
-const dbg         = document.getElementById('dbg');
+const connectBtn = document.getElementById('connect-btn');
+const statusDot  = document.getElementById('status-dot');
+const statusText = document.getElementById('status-text');
+const messages   = document.getElementById('messages');
+const msgInput   = document.getElementById('msg-input');
+const sendBtn    = document.getElementById('send-btn');
+const dbg        = document.getElementById('dbg');
 
-let audioCtx   = null;
-let fskNode    = null;
-let connected  = false;
+let audioCtx = null, fskNode = null, localPc = null, remotePc = null;
+let connected = false;
 
-function setStatus(state, text) {
-  statusDot.className = state;
-  statusText.textContent = text;
-}
-
-function addMsg(cls, text) {
-  const div = document.createElement('div');
-  div.className = 'msg ' + cls;
-  div.textContent = text;
-  messages.appendChild(div);
-  messages.scrollTop = messages.scrollHeight;
-}
-
+function setStatus(cls, txt) { statusDot.className = cls; statusText.textContent = txt; }
 function setDebug(t) { dbg.textContent = t; }
+function addMsg(cls, text) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls; d.textContent = text;
+  messages.appendChild(d); messages.scrollTop = messages.scrollHeight;
+}
 
 async function connect() {
-  setStatus('connecting', 'Requesting microphone…');
   connectBtn.disabled = true;
+  setStatus('connecting', 'Requesting microphone…');
 
   try {
-    /* Must request mic BEFORE creating AudioContext on iOS */
-    const stream = await navigator.mediaDevices.getUserMedia({
+    /* 1. Get mic — in MODE_IN_COMMUNICATION this will be BT SCO (ESP32 mic output) */
+    const micStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: false,
         noiseSuppression: false,
@@ -348,66 +296,84 @@ async function connect() {
       }
     });
 
-    /* Create context — iOS will force 44100 or 48000, that's fine */
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-
     if (audioCtx.state === 'suspended') await audioCtx.resume();
 
-    /* Load worklet from blob URL (single-file trick) */
+    /* 2. Load FSK worklet */
     const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
     const url  = URL.createObjectURL(blob);
     await audioCtx.audioWorklet.addModule(url);
     URL.revokeObjectURL(url);
 
-    /* Create FSK node */
     fskNode = new AudioWorkletNode(audioCtx, 'fsk-processor', {
-      numberOfInputs: 1,
-      numberOfOutputs: 1,
-      outputChannelCount: [1],
+      numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
     });
 
-    /* Wire up: mic stream → FSK input, FSK output → speakers */
-    const micSource = audioCtx.createMediaStreamSource(stream);
-    micSource.connect(fskNode);
-    fskNode.connect(audioCtx.destination);
+    /* 3. Mic → FSK input (decode what ESP32 sends us via BT SCO) */
+    audioCtx.createMediaStreamSource(micStream).connect(fskNode);
 
-    /* Handle decoded messages from ESP32 */
-    fskNode.port.onmessage = (e) => {
-      if (e.data.type === 'recv') {
-        addMsg('esp32', e.data.text);
-        setDebug('Received message');
-      } else if (e.data.type === 'crcerr') {
-        setDebug('CRC error — frame dropped');
-      }
+    /* 4. FSK output → MediaStreamDestination (to feed into WebRTC) */
+    const outDest = audioCtx.createMediaStreamDestination();
+    fskNode.connect(outDest);
+
+    /* 5. WebRTC loopback — forces Android into MODE_IN_COMMUNICATION
+     *    so both mic AND speaker route through BT HFP SCO              */
+    localPc  = new RTCPeerConnection();
+    remotePc = new RTCPeerConnection();
+
+    outDest.stream.getTracks().forEach(t => localPc.addTrack(t, outDest.stream));
+
+    localPc.onicecandidate  = e => e.candidate && remotePc.addIceCandidate(e.candidate);
+    remotePc.onicecandidate = e => e.candidate && localPc.addIceCandidate(e.candidate);
+
+    const offer = await localPc.createOffer();
+    await localPc.setLocalDescription(offer);
+    await remotePc.setRemoteDescription(offer);
+    const answer = await remotePc.createAnswer();
+    await remotePc.setLocalDescription(answer);
+    await localPc.setRemoteDescription(answer);
+
+    /* 6. Play remote audio — Chrome routes this through the call path → BT SCO → ESP32 */
+    remotePc.ontrack = ({ streams: [s] }) => {
+      const audio = document.createElement('audio');
+      audio.srcObject = s;
+      audio.volume = 1.0;
+      document.body.appendChild(audio);
+      audio.play().catch(() => {});
+    };
+
+    /* 7. Handle decoded messages from ESP32 */
+    fskNode.port.onmessage = e => {
+      if (e.data.type === 'recv') { addMsg('esp32', e.data.text); setDebug('Message received'); }
+      else if (e.data.type === 'crcerr') setDebug('CRC error — frame dropped');
     };
 
     connected = true;
-    setStatus('connected', 'Connected — audio channel open');
-    addMsg('sys', 'Audio channel ready. Messages to/from ESP32 will appear here.');
+    setStatus('connected', 'Connected via Bluetooth SCO');
+    addMsg('sys', 'Audio routed through Bluetooth. Type a message below.');
     msgInput.disabled = false;
     sendBtn.disabled  = false;
     msgInput.focus();
     connectBtn.textContent = 'Disconnect';
-    connectBtn.disabled = false;
-    connectBtn.onclick = disconnect;
+    connectBtn.disabled    = false;
+    connectBtn.onclick     = disconnect;
 
   } catch (err) {
-    setStatus('error', 'Error: ' + err.message);
-    addMsg('sys', 'Error: ' + err.message +
-      '\n\nMake sure:\n1. iPhone is paired with ESP32-Modem via BT\n2. This page is loaded over HTTPS');
+    setStatus('error', err.message);
+    addMsg('sys', 'Error: ' + err.message);
     connectBtn.disabled = false;
-    connectBtn.textContent = 'Retry';
   }
 }
 
 function disconnect() {
-  if (audioCtx) { audioCtx.close(); audioCtx = null; fskNode = null; }
+  localPc?.close(); remotePc?.close();
+  audioCtx?.close();
+  audioCtx = fskNode = localPc = remotePc = null;
   connected = false;
   setStatus('', 'Disconnected');
-  msgInput.disabled = true;
-  sendBtn.disabled  = true;
-  connectBtn.textContent = 'Connect';
-  connectBtn.onclick = connect;
+  msgInput.disabled = true; sendBtn.disabled = true;
+  connectBtn.textContent = 'Connect'; connectBtn.onclick = connect;
+  connectBtn.disabled = false;
 }
 
 function sendMessage() {
@@ -416,17 +382,14 @@ function sendMessage() {
   fskNode.port.postMessage({ type: 'send', text });
   addMsg('me', text);
   msgInput.value = '';
-  setDebug('Sending…');
 }
 
 connectBtn.onclick = connect;
 sendBtn.onclick    = sendMessage;
 msgInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
 
-/* Warn if not HTTPS */
-if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
-  addMsg('sys', 'WARNING: Microphone requires HTTPS. Host this page on GitHub Pages or similar.');
-}
+if (location.protocol !== 'https:' && location.hostname !== 'localhost')
+  addMsg('sys', 'WARNING: Microphone requires HTTPS.');
 </script>
 </body>
 </html>
